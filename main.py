@@ -1,8 +1,6 @@
 # before running the program you need to run next commands in the terminal
-# pip install pdfminer.six
 # pip install openpyxl
 import re
-from pdfminer.high_level import extract_text
 from openpyxl import load_workbook
 from openpyxl.utils.exceptions import IllegalCharacterError
 from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
@@ -20,15 +18,12 @@ def first_empty():
     return counter
 
 
-# function to turn the pdf file in the task into a list of separate articles
-def pdf_to_chunks(pdf_file: str):
-    text: str = extract_text(pdf_file)
-    split_text: list = re.split(r"(?=\bP\d{3}\b)", text)
-    split_text[-1] = re.split(r"www.medicaljournals.se/acta5th World Psoriasis & Psoriatic Arthritis Conference 2018",
-                              split_text[-1])
-    split_text[-1] = split_text[-1][0]
+def text_to_chunks(document: str) -> list:
+    with open(document, "rb") as magazine:
+        text = magazine.read().decode("utf-8", errors="replace")
+        split_text: list = re.split(r"(?=\bP\d{3}\b)", text)
 
-    return split_text
+    return split_text[1:]
 
 
 # function to work with some specific data in the pdf (the one with several authors with different affiliations)
@@ -41,10 +36,20 @@ def return_digit(text: str):
 
 
 # function to clean and to normalize text. I suggest it can be improved to refine the results
-def clean_text(txt: str):
-    cleaned_text: str = re.sub(r'www.medicaljournals.se/acta5th World Psoriasis & Psoriatic Arthritis Conference 2018',
-                               '', txt)
-    cleaned_text: str = ILLEGAL_CHARACTERS_RE.sub('', cleaned_text)
+def clean_text(txt: str) -> str:
+    cleaned_text = txt
+    patterns_to_remove = [
+        r'www.medicaljournals.se/acta',
+        r'\d\d?\s*5th World Psoriasis & Psoriatic Arthritis Conference 2018',
+        r'POSTERS',
+        r'Poster abstracts\s*\d\d?',
+        r'Acta Derm Venereol 2018',
+        r'\n\s*\n'
+    ]
+    for pattern in patterns_to_remove:
+        cleaned_text = re.sub(pattern, '\n', cleaned_text)
+
+    cleaned_text = re.sub(ILLEGAL_CHARACTERS_RE, '', cleaned_text)
 
     return cleaned_text
 
@@ -72,11 +77,73 @@ def create_presentation_pattern(text: str):
     return beginnings[0]
 
 
-# here we create a list of articles and clean them so that the parsing would be more precise
-split_text: list = pdf_to_chunks(
-    "Abstract Book from the 5th World Psoriasis and Psoriatic Arthritis Conference 2018.pdf")
+# here I decided to remove references at the end of some articles as they're a serious obstacle to regex patterns
+def remove_references(text: str):
+    pattern = "References:"
+    if pattern in text:
+        references = re.split(r"(?=References:)", text)[-1]
+        references = re.escape(references)
+        text = re.sub(r'{}'.format(references), '', text, flags=re.IGNORECASE)
+        return text
+    else:
+        return text
 
-cleaned_texts: list = [clean_text(text) for text in split_text][1:]
+
+# here I tried to create a decent function that would scrape through names
+# and I'd been thinking it works great until P036
+def create_name_list(text: str) -> list:
+    patterns_to_avoid = [
+        r'University',
+        r'Clinic',
+        r'Centre',
+        r'Center',
+        r'Department',
+    ]
+
+    text = text[0:len(text) // 4]
+
+    session = re.findall(r"\bP\d{3}\b", text)[0]
+
+    indexed_name_pattern = re.findall(r'([A-Z][a-z]+)(\s[A-Z][a-z]*)*(\d+)', text)
+
+    if indexed_name_pattern:
+        names = [''.join(name) for name in indexed_name_pattern]
+        return names
+
+    elements_to_remove = [session]
+    lines = text.split("\n")
+
+    for line in lines:
+        if re.match(r'\b[A-Z\s]+\b', line):
+            elements_to_remove.append(line)
+
+    for element in elements_to_remove:
+        text = re.sub(r'{}'.format(element), '', text)
+
+    text = re.sub(r'\n\n', '', text)
+    text = text.split('\n')
+
+    names = []
+
+    for line in text:
+        line = line.split(', ')
+
+        for name in line:
+            name = name.strip()
+
+            if re.match(r'([A-Z][a-z]+)(\s[A-Z]\.)*(\s[A-Z][a-z]+){1,3}', name):
+                names.append(name)
+
+    names_to_avoid = []
+
+    for pattern in patterns_to_avoid:
+        for name in names:
+            if pattern in name:
+                names_to_avoid.append(name)
+
+    names = [name for name in names if name not in names_to_avoid]
+
+    return names
 
 
 # class that represents each article
@@ -98,11 +165,11 @@ class Article:
         counter = first_empty()
 
         for person in self.person:
-            ws[f"A{counter + self.person.index(person)}"].value = person
+            ws[f"A{counter + self.person.index(person)}"].value = '' .join((char for char in person if not char.isdigit()))
 
             for affiliation in self.affiliation_location:
                 if return_digit(affiliation) == return_digit(person):
-                    ws[f"B{counter + self.person.index(person)}"].value = affiliation
+                    ws[f"B{counter + self.person.index(person)}"].value = '' .join((char for char in affiliation if not char.isdigit()))
 
             ws[f"D{counter + self.person.index(person)}"].value = self.session
             ws[f"E{counter + self.person.index(person)}"].value = self.topic_title
@@ -112,18 +179,19 @@ class Article:
 
 
 # function that creates an Article instance from a single article from the pdf
-def group_article(txt: str):
+def group_article(txt: str) -> Article:
+    txt = remove_references(txt)
     pattern_word = create_presentation_pattern(txt)
     lines = txt.split("\n")
-    person_lines = [line for line in lines[1:] if line.istitle()]
     topic_title_lines = [line for line in lines[1:] if line.isupper()]
-    person = [single_name.lstrip() for single_name in ''.join(person_lines).split(',')]
+    person = create_name_list(txt)
+    for element in person:
+        txt = re.sub(r'{},*'.format(element), '', txt)
     session = re.findall(r"\bP\d{3}\b", txt)[0]
 
     if pattern_word:
         info = re.split(r'(?={})'.format(pattern_word), txt, flags=re.IGNORECASE)
-        affiliation_location_lines = [item for item in info[0].split("\n") if
-                                      item not in person_lines and item not in topic_title_lines][1:]
+        affiliation_location_lines = [item for item in info[0].split("\n") if item not in topic_title_lines][1:]
         affiliation_location = re.split(r'(?=\d[A-Z])', ''.join(affiliation_location_lines))
         affiliation_location = [item for item in affiliation_location if item != '']
         topic_title = ''.join(topic_title_lines)
@@ -137,13 +205,20 @@ def group_article(txt: str):
 
 
 # encountered_errors list and try/except were used to avoid IllegalCharacterError previously
-encountered_errors = []
-for text in cleaned_texts:
-    try:
-        article = group_article(text)
-        article.upload_excel()
-    except IllegalCharacterError as e:
-        encountered_errors.append(article.session)
-        print(f"We have encountered an Error in {article.session}")
+# here we create a list of articles and clean them so that the parsing would be more precise
+def upload_all():
+    split_text: list = text_to_chunks("magazine.json")
 
+    cleaned_texts: list = [clean_text(text) for text in split_text]
+    encountered_errors = []
+    for text in cleaned_texts:
+        try:
+            article = group_article(text)
+            article.upload_excel()
+        except IllegalCharacterError as e:
+            encountered_errors.append(article.session)
+            print(f"We have encountered an Error in {article.session}")
+
+
+upload_all()
 # I'm aware that the results of the parsing could be better and I'm sure I can improve the results
